@@ -71,7 +71,14 @@ jobs:
       - name: Build VectorCraft APK
         run: |
           cd "$BUILDER_DIR"
-          chmod +x launcher/apps/artcraft-launcher-android/generate-catalog.sh
+          
+          CATALOG_SCRIPT=$(find "$BUILDER_DIR" -type f -name "generate-catalog.sh" | head -n 1)
+          if [ -z "$CATALOG_SCRIPT" ]; then
+            echo "generate-catalog.sh not found!"
+            exit 1
+          fi
+
+          chmod +x "$CATALOG_SCRIPT"
           bash build.sh -vectorcraft
 
       - name: Upload VectorCraft APK
