@@ -71,6 +71,7 @@ jobs:
       - name: Build VectorCraft APK
         run: |
           cd "$BUILDER_DIR"
+          chmod +x generate-catalog.sh
           bash build.sh -vectorcraft
 
       - name: Upload VectorCraft APK
