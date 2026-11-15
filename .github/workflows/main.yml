@@ -9,11 +9,15 @@ permissions:
 
 jobs:
   build:
-    name: Build VectorCraft
+    name: Validate and Build VectorCraft
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
+      # ==========================================
+      # PHASE 1 - SOURCE AND TOOLCHAIN
+      # ==========================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -41,6 +45,8 @@ jobs:
       - name: Configure Android environment
         shell: bash
         run: |
+          set -euo pipefail
+
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
           echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
@@ -49,10 +55,19 @@ jobs:
       - name: Install cargo-ndk
         shell: bash
         run: |
-          cargo install cargo-ndk --locked
+          set -euo pipefail
+
+          if ! command -v cargo-ndk >/dev/null 2>&1; then
+            cargo install cargo-ndk --locked
+          fi
+
           cargo ndk --version
 
-      - name: Extract source
+      # ==========================================
+      # PHASE 2 - EXTRACT AND INSPECT SOURCE
+      # ==========================================
+
+      - name: Extract source ZIP
         shell: bash
         run: |
           set -euo pipefail
@@ -69,82 +84,164 @@ jobs:
           fi
 
           mkdir -p "$GITHUB_WORKSPACE/builder"
+
+          unzip -tq "$ZIP_FILE"
           unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/builder"
 
-          echo "Source extracted."
-          echo "ZIP: $ZIP_FILE"
+          echo "Source extracted successfully."
 
-      - name: Locate VectorCraft build directory
+      - name: Locate build directory
         shell: bash
         run: |
           set -euo pipefail
 
-          BUILD_SCRIPT=$(find "$GITHUB_WORKSPACE/builder" \
-            -type f \
-            -path '*/launcher/apps/artcraft-launcher-android/build.sh' \
-            | head -n 1)
+          mapfile -t BUILD_SCRIPTS < <(
+            find "$GITHUB_WORKSPACE/builder" \
+              -type f \
+              -path '*/launcher/apps/artcraft-launcher-android/build.sh'
+          )
 
-          if [ -z "$BUILD_SCRIPT" ]; then
-            echo "::error::Expected VectorCraft build script not found."
-            find "$GITHUB_WORKSPACE/builder" -name build.sh -print
+          if [ "${#BUILD_SCRIPTS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Android build.sh."
+            printf '%s\n' "${BUILD_SCRIPTS[@]}"
             exit 1
           fi
 
-          APP_DIR=$(dirname "$BUILD_SCRIPT")
+          APP_DIR=$(dirname "${BUILD_SCRIPTS[0]}")
 
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
 
           echo "Build directory:"
           echo "$APP_DIR"
 
-      - name: Prepare build scripts
+      # ==========================================
+      # PHASE 3 - PREFLIGHT VALIDATION
+      # ==========================================
+
+      - name: Validate source structure
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -d "$APP_DIR" ]; then
-            echo "::error::Build directory does not exist."
+          test -f "$APP_DIR/build.sh"
+
+          if [ ! -d "$APP_DIR/android" ]; then
+            echo "::error::Android project directory missing."
             exit 1
           fi
 
-          SCRIPT_COUNT=$(find "$GITHUB_WORKSPACE/builder" \
-            -type f -name '*.sh' | wc -l)
+          echo "Source structure validated."
+
+          echo "VectorCraft references in build scripts:"
+          grep -Rni \
+            --include='*.sh' \
+            'vectorcraft' "$APP_DIR" || true
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT_COUNT=0
+
+          while IFS= read -r -d '' SCRIPT; do
+            SCRIPT_COUNT=$((SCRIPT_COUNT + 1))
+
+            chmod u+x "$SCRIPT"
+
+            if ! bash -n "$SCRIPT"; then
+              echo "::error::Shell syntax error: $SCRIPT"
+              exit 1
+            fi
+
+          done < <(
+            find "$GITHUB_WORKSPACE/builder" \
+              -type f -name '*.sh' -print0
+          )
 
           if [ "$SCRIPT_COUNT" -eq 0 ]; then
             echo "::error::No shell scripts found."
             exit 1
           fi
 
-          find "$GITHUB_WORKSPACE/builder" \
-            -type f -name '*.sh' \
-            -exec chmod u+x {} \;
+          echo "Validated $SCRIPT_COUNT shell scripts."
 
-          echo "Prepared $SCRIPT_COUNT shell scripts."
-
-          for SCRIPT in generate-catalog.sh generate-about.sh; do
-            if ! find "$APP_DIR" -type f -name "$SCRIPT" \
-              | grep -q .; then
-              echo "::warning::$SCRIPT not found inside APP_DIR."
-            fi
-          done
-
-      - name: Verify build environment
+      - name: Validate Gradle Wrapper
         shell: bash
         run: |
           set -euo pipefail
 
-          command -v cargo
-          command -v python
+          mapfile -t GRADLE_FILES < <(
+            find "$APP_DIR" -type f -name gradlew
+          )
+
+          if [ "${#GRADLE_FILES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Gradle wrapper."
+            printf '%s\n' "${GRADLE_FILES[@]}"
+            exit 1
+          fi
+
+          GRADLEW="${GRADLE_FILES[0]}"
+          GRADLE_DIR=$(dirname "$GRADLEW")
+          WRAPPER_DIR="$GRADLE_DIR/gradle/wrapper"
+
+          test -f "$WRAPPER_DIR/gradle-wrapper.jar"
+          test -f "$WRAPPER_DIR/gradle-wrapper.properties"
+
+          chmod u+x "$GRADLEW"
+
+          if [ ! -x "$GRADLEW" ]; then
+            echo "::error::Gradle wrapper is not executable."
+            exit 1
+          fi
+
+          bash -n "$GRADLEW"
+
+          echo "GRADLEW_PATH=$GRADLEW" >> "$GITHUB_ENV"
+
+          echo "Gradle wrapper validated:"
+          ls -l "$GRADLEW"
+          cat "$WRAPPER_DIR/gradle-wrapper.properties"
+
+      - name: Validate Android and Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
           command -v java
+          command -v python
+          command -v cargo
+          command -v cargo-ndk
 
           test -d "$ANDROID_NDK_HOME"
-          test -f "$APP_DIR/build.sh"
+          test -d "$ANDROID_HOME/platforms/android-35"
+          test -d "$ANDROID_HOME/build-tools/35.0.0"
+
+          rustup target list --installed \
+            | grep -qx 'aarch64-linux-android'
 
           cargo ndk --version
           java -version
           python --version
+          rustc --version
+          cargo --version
 
-          echo "Build environment checks passed."
+          echo "Toolchain validation passed."
+
+      - name: Test Gradle Wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$(dirname "$GRADLEW_PATH")"
+
+          ./gradlew --version
+
+          echo "Gradle wrapper test passed."
+
+      # ==========================================
+      # PHASE 4 - BUILD
+      # ==========================================
 
       - name: Build VectorCraft
         shell: bash
@@ -153,13 +250,17 @@ jobs:
 
           cd "$APP_DIR"
 
-          echo "Starting VectorCraft-only build..."
+          echo "Starting VectorCraft build..."
 
           bash build.sh -vectorcraft
 
           echo "Build command completed."
 
-      - name: Verify and collect APK
+      # ==========================================
+      # PHASE 5 - APK VALIDATION
+      # ==========================================
+
+      - name: Verify APK output
         shell: bash
         run: |
           set -euo pipefail
@@ -173,9 +274,8 @@ jobs:
           )
 
           if [ "${#APK_FILES[@]}" -eq 0 ]; then
-            echo "::error::No APK was generated."
+            echo "::error::No APK generated."
 
-            echo "Build output directories:"
             find "$GITHUB_WORKSPACE/builder" \
               -type d \
               \( -name output -o -name apk -o -name build \) \
@@ -184,12 +284,40 @@ jobs:
             exit 1
           fi
 
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+
+          if [ ! -x "$AAPT" ]; then
+            echo "::error::Android aapt tool not found."
+            exit 1
+          fi
+
+          INDEX=0
+
           for APK in "${APK_FILES[@]}"; do
-            echo "Found APK: $APK"
-            cp "$APK" "$GITHUB_WORKSPACE/artifacts/"
+            INDEX=$((INDEX + 1))
+
+            echo "Checking APK: $APK"
+
+            if ! unzip -tq "$APK"; then
+              echo "::error::Invalid APK archive: $APK"
+              exit 1
+            fi
+
+            echo "APK package information:"
+            "$AAPT" dump badging "$APK" | head -n 5
+
+            OUTPUT_NAME="VectorCraft-candidate-$INDEX.apk"
+
+            cp "$APK" "$GITHUB_WORKSPACE/artifacts/$OUTPUT_NAME"
+
+            echo "Saved: $OUTPUT_NAME"
           done
 
-          echo "APK collection completed."
+          echo "Validated $INDEX APK candidate(s)."
+
+      # ==========================================
+      # PHASE 6 - UPLOAD
+      # ==========================================
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
