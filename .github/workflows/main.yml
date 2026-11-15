@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Set up Java 17
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -32,59 +32,169 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-    
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk
-     
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.0.12077973'
 
       - name: Configure Android environment
+        shell: bash
         run: |
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Extract ArtCraft Builder
+      - name: Install cargo-ndk
+        shell: bash
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -type f -name '*vectorcraft-font-permission-fix.zip' | head -n 1)
+          cargo install cargo-ndk --locked
+          cargo ndk --version
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE=$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 1 \
+            -type f \
+            -name '*vectorcraft-font-permission-fix.zip' \
+            | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "Builder ZIP not found!"
+            echo "::error::Source ZIP not found."
             exit 1
           fi
 
-          mkdir -p builder
-          unzip -q "$ZIP_FILE" -d builder
+          mkdir -p "$GITHUB_WORKSPACE/builder"
+          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/builder"
 
-          BUILD_SCRIPT=$(find "$GITHUB_WORKSPACE/builder" -type f -name build.sh | head -n 1)
+          echo "Source extracted."
+          echo "ZIP: $ZIP_FILE"
+
+      - name: Locate VectorCraft build directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_SCRIPT=$(find "$GITHUB_WORKSPACE/builder" \
+            -type f \
+            -path '*/launcher/apps/artcraft-launcher-android/build.sh' \
+            | head -n 1)
 
           if [ -z "$BUILD_SCRIPT" ]; then
-            echo "build.sh not found!"
+            echo "::error::Expected VectorCraft build script not found."
+            find "$GITHUB_WORKSPACE/builder" -name build.sh -print
             exit 1
           fi
 
-          BUILDER_DIR=$(dirname "$BUILD_SCRIPT")
-          echo "BUILDER_DIR=$BUILDER_DIR" >> $GITHUB_ENV
+          APP_DIR=$(dirname "$BUILD_SCRIPT")
 
-      - name: Build VectorCraft APK
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+
+          echo "Build directory:"
+          echo "$APP_DIR"
+
+      - name: Prepare build scripts
+        shell: bash
         run: |
-          cd "$BUILDER_DIR"
-          
-          CATALOG_SCRIPT=$(find "$BUILDER_DIR" -type f -name "generate-catalog.sh" | head -n 1)
-          if [ -z "$CATALOG_SCRIPT" ]; then
-            echo "generate-catalog.sh not found!"
+          set -euo pipefail
+
+          if [ ! -d "$APP_DIR" ]; then
+            echo "::error::Build directory does not exist."
             exit 1
           fi
 
-          chmod +x "$CATALOG_SCRIPT"
+          SCRIPT_COUNT=$(find "$GITHUB_WORKSPACE/builder" \
+            -type f -name '*.sh' | wc -l)
+
+          if [ "$SCRIPT_COUNT" -eq 0 ]; then
+            echo "::error::No shell scripts found."
+            exit 1
+          fi
+
+          find "$GITHUB_WORKSPACE/builder" \
+            -type f -name '*.sh' \
+            -exec chmod u+x {} \;
+
+          echo "Prepared $SCRIPT_COUNT shell scripts."
+
+          for SCRIPT in generate-catalog.sh generate-about.sh; do
+            if ! find "$APP_DIR" -type f -name "$SCRIPT" \
+              | grep -q .; then
+              echo "::warning::$SCRIPT not found inside APP_DIR."
+            fi
+          done
+
+      - name: Verify build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v cargo
+          command -v python
+          command -v java
+
+          test -d "$ANDROID_NDK_HOME"
+          test -f "$APP_DIR/build.sh"
+
+          cargo ndk --version
+          java -version
+          python --version
+
+          echo "Build environment checks passed."
+
+      - name: Build VectorCraft
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$APP_DIR"
+
+          echo "Starting VectorCraft-only build..."
+
           bash build.sh -vectorcraft
 
-      - name: Upload VectorCraft APK
+          echo "Build command completed."
+
+      - name: Verify and collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          mapfile -t APK_FILES < <(
+            find "$GITHUB_WORKSPACE/builder" \
+              -type f \
+              -iname '*.apk'
+          )
+
+          if [ "${#APK_FILES[@]}" -eq 0 ]; then
+            echo "::error::No APK was generated."
+
+            echo "Build output directories:"
+            find "$GITHUB_WORKSPACE/builder" \
+              -type d \
+              \( -name output -o -name apk -o -name build \) \
+              -print
+
+            exit 1
+          fi
+
+          for APK in "${APK_FILES[@]}"; do
+            echo "Found APK: $APK"
+            cp "$APK" "$GITHUB_WORKSPACE/artifacts/"
+          done
+
+          echo "APK collection completed."
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: VectorCraft-Android-APK
-          path: builder/**/output/*.apk
+          path: artifacts/*.apk
           if-no-files-found: error
           retention-days: 30
